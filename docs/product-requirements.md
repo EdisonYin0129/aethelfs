@@ -26,6 +26,7 @@
 -   **Testability:** Support for file-backed device simulation is a first-class feature, enabling development and testing on any Linux machine.
     
 
+
 #### 4. System Architecture
 
 AethelFS consists of two main components: the management utilities and the FUSE daemon.
@@ -86,71 +87,87 @@ AethelFS consists of two main components: the management utilities and the FUSE 
 
 #### 5. On-Device Data Structures & Metadata
 
-Each AethelFS pool (a single `/dev/daxX.Y` device or file) has a simple, well-defined layout. We will use a 4KB block size as our fundamental unit.
+To ensure robustness, AethelFS adopts a redundant labeling scheme inspired by ZFS. Each device in a pool contains four labels, two at the beginning and two at the end. This provides strong protection against accidental overwrites or localized media corruption.
 
-**On-Disk Layout:**
+**On-Device Layout:**
+
+```
++------------------+------------------+----------------------------------+------------------+------------------+
+|    Label 0       |    Label 1       |         Usable Data Area         |    Label 2       |    Label 3       |
+|     256KB        |     256KB        |      (Filesystem data blocks,    |     256KB        |     256KB        |
+|                  |                  |       bitmaps, inode tables)     |                  |                  |
++------------------+------------------+----------------------------------+------------------+------------------+
+^                  ^                                                     ^                  ^
+|                  |                                                     |                  |
+0KB              256KB                                           (Size - 512KB)     (Size - 256KB)
+
+```
+
+**Label Structure (256KB):**
+
+Each of the four labels is identical in structure and contains the full configuration for the pool.
 
 ```
 +-----------------------------------------------------------------------------+
-| Block 0: Pool Label                                                         |
-| (Identifies the device as part of a specific AethelFS pool)                 |
-| - Magic Number (e.g., 0xA37BE1F5)                                           |
-| - Pool UUID                                                                 |
-| - Checksum                                                                  |
+| Offset | Size   | Description                                                 |
 +-----------------------------------------------------------------------------+
-| Block 1: Filesystem Superblock                                              |
-| (Describes the layout and state of the filesystem within the pool)          |
-| - Filesystem UUID                                                           |
-| - Block Size (e.g., 4096)                                                   |
-| - Total Block Count                                                         |
-| - Pointer to Inode Allocation Bitmap                                        |
-| - Pointer to Data Block Allocation Bitmap                                   |
-| - Pointer to Inode Table                                                    |
-| - Pointer to Root Directory Inode (always Inode #1)                         |
+| 0KB    | 16KB   | Blank Space (Reserved for bootloaders, VTOC, etc.)          |
++--------+--------+-------------------------------------------------------------+
+| 16KB   | 112KB  | NVList (Name-Value List) Area                               |
+|        |        | - XDR encoded key-value pairs                               |
+|        |        | - e.g., pool_name, pool_guid, version, features, hostname   |
+|        |        | - state: (ACTIVE, EXPORTED, etc.)                           |
+|        |        | - txg: transaction group number for this label write        |
++--------+--------+-------------------------------------------------------------+
+| 128KB  | 128KB  | Uberblock Array (128 x 1KB structures)                      |
+|        |        | - A circular log of pointers to the root of the filesystem. |
+|        |        | - Each write creates a new Uberblock.                       |
+|        |        | - The one with the highest valid transaction ID is active.  |
 +-----------------------------------------------------------------------------+
-| Blocks 2 to N: Inode Allocation Bitmap                                      |
-| (A bitmask to track which inode entries in the Inode Table are used)        |
-+-----------------------------------------------------------------------------+
-| Blocks N+1 to M: Data Block Allocation Bitmap                               |
-| (A bitmask to manage free/used data blocks)                                 |
-+-----------------------------------------------------------------------------+
-| Blocks M+1 to K: Inode Table                                                |
-| (An array of fixed-size inode structures)                                   |
-|   Inode Structure:                                                          |
-|   - Mode (file type, permissions)                                           |
-|   - UID / GID                                                               |
-|   - Size (in bytes)                                                         |
-|   - Timestamps (atime, mtime, ctime)                                        |
-|   - Link Count                                                              |
-|   - Direct Block Pointers [12] (pointers to data blocks)                    |
-|   - Indirect Block Pointer (pointer to a block of more pointers)            |
-|   - Double Indirect Block Pointer                                           |
-+-----------------------------------------------------------------------------+
-| Blocks K+1 to End: Data Blocks                                              |
-| (The actual file content and directory entries)                             |
-+-----------------------------------------------------------------------------+
+
 ```
 
-**Metadata Class Diagram:**
+**Uberblock Structure (1KB):**
+
+The Uberblock is the bridge from the fixed-location label to the variable-location live filesystem data.
+
+```
+- magic:      0xA37BE1F5 (AethelFS Uberblock)
+- version:    Filesystem version
+- txg:        Transaction group number
+- guid_sum:   Checksum of all device GUIDs in the pool
+- timestamp:  Time of this transaction
+- root_bp:    Block Pointer to the Filesystem Superblock
+
+```
+
+**Metadata Class Diagram (Updated):**
+
+The daemon now finds the active Uberblock across all labels, which in turn points to the single live Superblock.
 
 ```
 +-----------------+
 | AethelFSDaemon  |
 +-----------------+
         | 1
-        | has-a
-        v
+        | scans
+        v 4
++-----------------+      contains      +-----------------+
+|      Label      |------------------->| Uberblock Array |
++-----------------+   128 per label    +-----------------+
+                                               | (finds active)
+                                               | 1
+                                               v
 +-----------------+      manages       +----------------+
 |   Superblock    |------------------->|  InodeBitmap   |
-+-----------------+                    +----------------+
-        |                              +----------------+
-        |----------------------------->| DataBlockBitmap|
+| (pointed to by  |                    +----------------+
+| active Uberblock)|                    +----------------+
++-----------------+------------------->| DataBlockBitmap|
         | 1                            +----------------+
         | has-an
         v
 +-----------------+
 |   InodeTable    |
-| (array of Inode)|
 +-----------------+
         | 1..*
         | contains
@@ -158,24 +175,18 @@ Each AethelFS pool (a single `/dev/daxX.Y` device or file) has a simple, well-de
 +-----------------+
 |      Inode      |
 +-----------------+
- | (if directory)
- | 1
- v
-+-----------------+
-|   DataBlock     |
-| (as directory)  |
-+-----------------+
-  | 1..*
-  | contains
-  v
-+-----------------+
-| DirectoryEntry  |
-| - name          |
-| - inode_number  |
-+-----------------+
+
 ```
 
 #### 6. Command Line Interface (CLI)
+
+The CLI design remains the same, but the underlying actions are now more robust.
+
+-   `apool create` will write all four labels, populating the NVList with pool information.
+    
+-   `afs create` will find the pool's labels and write the first Uberblock, pointing it to a newly allocated and initialized Superblock.
+    
+-   `afs mount` will scan all four labels on the device, find the valid Uberblock with the highest transaction group number (`txg`), and use its `root_bp` to find and `mmap` the filesystem
 
 ##### 6.1. Pool Management (`apool`)
 
@@ -266,9 +277,9 @@ The `afs` command manages filesystems within a pool.
 
 #### 7. Man Pages
 
-##### `apool` MAN Page
+##### `apool(8)`
 
-```text
+
 APOOL(1)                  User Commands                 APOOL(1)
 
 NAME
@@ -330,9 +341,8 @@ EXAMPLES
 
 SEE ALSO
     aethelfs(7)
-```
 
-##### `afs` MAN Page
+##### `afs(8)`
 
 ```text
 AFS(1)                    User Commands                  AFS(1)
@@ -477,3 +487,5 @@ To get a prototype working quickly, focus on the absolute essentials.
         
     -   Pool resizing or advanced management features.
         
+
+This tightly scoped MVP provides a complete end-to-end user flow, proves the architectural concept, and builds a solid foundation for future enhancements.

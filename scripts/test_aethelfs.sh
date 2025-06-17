@@ -29,7 +29,7 @@ echo -e "${BLUE}=== AethelFS Test Suite ===${NC}"
 if ! mount | grep -q "$MOUNT_POINT"; then
     echo -e "${RED}Error: Filesystem not mounted at $MOUNT_POINT${NC}"
     echo "Please run your filesystem first using the Makefile:"
-    echo "  make run"
+    echo "  make mount"
     echo "Then select the appropriate DAX device when prompted."
     exit 1
 fi
@@ -166,3 +166,19 @@ time dd if="$MOUNT_POINT/perftest" of=/dev/null bs=1M status=progress
 echo -e "\n${BLUE}All tests completed!${NC}"
 echo "You can now unmount the filesystem with:"
 echo "  sudo fusermount -u $MOUNT_POINT"
+
+# Test 11: Large File Performance Test (reduced from 1GB to 250MB)
+echo -e "\n${YELLOW}Test 11: Extended Performance Test (250MB)${NC}"
+echo "Writing 250MB file and measuring time..."
+time dd if=/dev/zero of="$MOUNT_POINT/large_perftest" bs=10M count=25 status=progress
+
+echo "Reading 250MB file and measuring time..."
+time dd if="$MOUNT_POINT/large_perftest" of=/dev/null bs=10M status=progress
+
+# Optional: Add random I/O test if fio is available
+if command -v fio &> /dev/null; then
+    echo -e "\n${YELLOW}Test 12: Random I/O Test${NC}"
+    echo "Running random I/O with fio..."
+    fio --name=random-rw --filename="$MOUNT_POINT/fio_test" --size=50M \
+        --rw=randrw --bs=4k --direct=1 --runtime=30 --time_based
+fi
